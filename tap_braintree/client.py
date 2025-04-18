@@ -33,13 +33,14 @@ class BraintreeStream(Stream):
     @property
     def start_date(self):
         # All of this logic is a workaround to how slow the Braintree API can be. We only
-        # need the last month of transactions because within that time period, their status
-        # would update and shouldn't update again after that. For subscriptions, things
-        # get a bit more complicated. On a daily basis, we only really need to fetch the
-        # last few days of data, because that would capture daily trials started But, since
-        # we care about the state of TTP and TTA subscriptions there's additional logic
-        # allowing for a weekly sync (grabs the last 3 months) and full sync of subscriptions
-        # data
+        # need the last week or so of transactions because within that time period, their
+        # status would update and shouldn't update again after that. For subscriptions,
+        # things get a bit more complicated. On a daily basis, we only really need to fetch
+        # the last month of data, because that would capture daily trials started/converted.
+        # But, since we care about the Trial-to-Active rate for subscriptions, there's additional
+        # logic allowing for a weekly sync (grabs the last 3 months) and full sync of subscriptions
+        # data. Note, to cut down on run time, the full sync of subscriptions actually only
+        # fetches the previous month's data for each year in the time since the start_date.
         if self.config["sync_state"] == "regular":
             if self.name == "subscriptions":
                 return str(datetime.now() - relativedelta(months=1))
@@ -225,82 +226,136 @@ class BraintreeStream(Stream):
     def get_records(self, context: Optional[dict]) -> Iterable[dict]:
         """Return a generator of row-type dictionary objects."""
         self.logger.info(f" tap_states: {self.tap_state}")
-
         self.set_braintree_config()
-        start_timestamp = self.get_starting_timestamp(context) or isoparse(
-            self.start_date
-        )
-        start_timestamp = start_timestamp.replace(tzinfo=pytz.timezone("UTC"))
-        end_timestamp = datetime.utcnow()
-        end_timestamp = end_timestamp.replace(tzinfo=pytz.timezone("UTC"))
-        self.logger.info(
-            f"start timestamp is: {start_timestamp} and end timestamp is: {end_timestamp}"
-        )
-        state_dict = self.get_context_state(context)
+        end_timestamp = datetime.utcnow().replace(tzinfo=pytz.UTC)
+        
+        # Logic for braintree subscriptions full sync.
+        if self.config["sync_state"] == "full":
+            start_date_config = isoparse(self.config["start_date"]).replace(tzinfo=pytz.UTC)
+            last_month_date = end_timestamp - relativedelta(months=1)
+            target_month = last_month_date.month
 
-        self.logger.info(f" state_dict: {state_dict}")
-        self.logger.info(f" tap_states: {self.tap_state}")
-
-        """  
-        TODO: 
-            Come up with a better way to make this work as state isn't working because multi-key state is unsupported
-            from one stream and because braintree won't let you query by updated_at for all the needed keys
-        """
-        last_updated = datetime.strptime(self.global_stream_state, "%Y-%m-%d")
-
-        for start, end in self.date_range(
-            start_timestamp,
-            end_timestamp,
-            interval_in_hours=self.fetch_records_interval_hours,
-        ):
-            while True:
-                try:
-                    records = self.braintree_obj.search(
-                        self.braintree_search.between(start, end)
-                    )
-                    self.check_api_result_limits(records)
-                    max_records_expected = records.maximum_size
-                    self.logger.info(
-                        " {}: Fetched {} records from {} - {}".format(
-                            self.name, max_records_expected, start, end
-                        )
-                    )
-
-                    processed_count = 0
-                    self.logger.info(f"last_updated: {last_updated}")
-                    for record in records:
-                        if self.contains_latest_record(record, last_updated):
-                            processed_count += 1
-                            yield self.parse_record(record)
-
-                except (
-                    braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError
-                ) as e:
-                    self.logger.error(f" Exception: {str(e)}")
-                    self.logger.error("Waiting 1 hour, then trying again...")
-                    time.sleep(3600)
+            # Build a list of month start dates (one per year) for the current month,
+            # starting from the year of start_date_config until the previous year.
+            months_to_sync = []
+            for year in range(start_date_config.year, last_month_date.year):
+                month_start = datetime(year, target_month, 1, tzinfo=pytz.UTC)
+                if month_start < start_date_config:
                     continue
+                if month_start > last_month_date:
+                    break
+                months_to_sync.append(month_start)
 
-                except (ConnectionError, ReadTimeout) as e:
-                    self.logger.error(
-                        " {}: Failed to process records from {} - {}".format(
-                            self.name,
-                            start.date(),
-                            end.date(),
+            self.logger.info(f"Full sync will process these month start dates: {months_to_sync}")
+
+            for month_start in months_to_sync:
+                month_end = month_start + relativedelta(months=1)
+                if month_end > last_month_date:
+                    month_end = last_month_date
+                self.logger.info(f"Syncing data for period: {month_start} to {month_end}")
+
+                for start, end in self.date_range(
+                    month_start,
+                    month_end,
+                    interval_in_hours=self.fetch_records_interval_hours,
+                ):
+                    while True:
+                        try:
+                            records = self.braintree_obj.search(
+                                self.braintree_search.between(start, end)
+                            )
+                            self.check_api_result_limits(records)
+                            max_records_expected = records.maximum_size
+                            self.logger.info(
+                                " {}: Fetched {} records from {} - {}".format(
+                                    self.name, max_records_expected, start, end
+                                )
+                            )
+
+                            processed_count = 0
+                            for record in records:
+                                if self.contains_latest_record(record, datetime.strptime(self.global_stream_state, "%Y-%m-%d")):
+                                    processed_count += 1
+                                    yield self.parse_record(record)
+
+                        except braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError as e:
+                            self.logger.error(f" Exception: {str(e)}")
+                            self.logger.error("Waiting 1 hour, then trying again...")
+                            time.sleep(3600)
+                            continue
+
+                        except (ConnectionError, ReadTimeout) as e:
+                            self.logger.error(
+                                " {}: Failed to process records from {} - {}".format(
+                                    self.name,
+                                    start.date(),
+                                    end.date(),
+                                )
+                            )
+                            self.logger.error(f" Exception: {str(e)}")
+                            break
+
+                        self.logger.info(
+                            " {}: Processed {} of {} records at {}".format(
+                                self.name,
+                                processed_count,
+                                max_records_expected,
+                                datetime.utcnow(),
+                            )
                         )
-                    )
-                    self.logger.error(f" Exception: {str(e)}")
-                    self.logger.error(
-                        f" Exception occurred while processing record:\n{record}"
+                        break
+
+        else:
+            start_timestamp = self.get_starting_timestamp(context) or isoparse(self.start_date)
+            start_timestamp = start_timestamp.replace(tzinfo=pytz.UTC)
+
+            for start, end in self.date_range(
+                start_timestamp,
+                end_timestamp,
+                interval_in_hours=self.fetch_records_interval_hours,
+            ):
+                while True:
+                    try:
+                        records = self.braintree_obj.search(
+                            self.braintree_search.between(start, end)
+                        )
+                        self.check_api_result_limits(records)
+                        max_records_expected = records.maximum_size
+                        self.logger.info(
+                            " {}: Fetched {} records from {} - {}".format(
+                                self.name, max_records_expected, start, end
+                            )
+                        )
+
+                        processed_count = 0
+                        for record in records:
+                            if self.contains_latest_record(record, datetime.strptime(self.global_stream_state, "%Y-%m-%d")):
+                                processed_count += 1
+                                yield self.parse_record(record)
+
+                    except braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError as e:
+                        self.logger.error(f" Exception: {str(e)}")
+                        self.logger.error("Waiting 1 hour, then trying again...")
+                        time.sleep(3600)
+                        continue
+
+                    except (ConnectionError, ReadTimeout) as e:
+                        self.logger.error(
+                            " {}: Failed to process records from {} - {}".format(
+                                self.name,
+                                start.date(),
+                                end.date(),
+                            )
+                        )
+                        self.logger.error(f" Exception: {str(e)}")
+                        break
+
+                    self.logger.info(
+                        " {}: Processed {} of {} records at {}".format(
+                            self.name,
+                            processed_count,
+                            max_records_expected,
+                            datetime.utcnow(),
+                        )
                     )
                     break
-
-                self.logger.info(
-                    " {}: Processed {} of {} records at {}".format(
-                        self.name,
-                        processed_count,
-                        max_records_expected,
-                        datetime.utcnow(),
-                    )
-                )
-                break
