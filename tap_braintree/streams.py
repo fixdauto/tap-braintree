@@ -54,6 +54,8 @@ class TransactionsStream(BraintreeStream):
         Property("billing_street_address", StringType),
         Property("channel", StringType),
         Property("created_at", DateTimeType),
+        Property("android_pay_card_source_card_type", StringType),
+        Property("apple_pay_card_type", StringType),
         Property("credit_card_bin", StringType),
         Property("credit_card_card_type", StringType),
         Property("credit_card_cardholder_name", StringType),
