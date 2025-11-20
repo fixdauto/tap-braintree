@@ -387,25 +387,59 @@ class TransactionsStream(BraintreeStream):
             or parsed['billing_country_code_alpha2'] == ''
             or parsed['billing_region'] == ''
         ):
-            try:
+            def _populate_billing_from_customer() -> None:
+                """Lookup customer and update billing fields from first valid address."""
                 customer = braintree.Customer.find(parsed["customer_id"])
                 if customer and hasattr(customer, 'addresses') and customer.addresses:
                     # Find first address with a valid country code.
                     valid_address = next(
-                        (addr for addr in customer.addresses
-                         if hasattr(addr, 'country_code_alpha2') and
-                         addr.country_code_alpha2 is not None),
-                        None
+                        (
+                            addr
+                            for addr in customer.addresses
+                            if hasattr(addr, 'country_code_alpha2')
+                            and addr.country_code_alpha2 is not None
+                        ),
+                        None,
                     )
 
                     if valid_address:
                         if not parsed.get('billing_country_code_alpha2'):
-                            self.logger.info(f"Found valid address for customer {parsed['customer_id']}")
-                            parsed['billing_country_code_alpha2'] = valid_address.country_code_alpha2
+                            self.logger.info(
+                                f"Found valid address for customer {parsed['customer_id']}"
+                            )
+                            parsed['billing_country_code_alpha2'] = (
+                                valid_address.country_code_alpha2
+                            )
                         if not parsed.get('billing_region'):
                             parsed['billing_region'] = valid_address.region
+
+            try:
+                _populate_billing_from_customer()
             except braintree.exceptions.NotFoundError:
                 self.logger.warning(f"Customer {parsed['customer_id']} not found")
+            except Exception as exc:
+                # Handle transient network / API issues
+                self.logger.warning(
+                    "Error looking up customer %s (%s). "
+                    "Waiting 30 seconds and retrying once.",
+                    parsed.get("customer_id"),
+                    exc,
+                )
+                time.sleep(30)
+                try:
+                    _populate_billing_from_customer()
+                except braintree.exceptions.NotFoundError:
+                    self.logger.warning(
+                        f"Customer {parsed['customer_id']} not found on retry"
+                    )
+                except Exception as exc2:
+                    # Give up after one retry, but do NOT crash the tap
+                    self.logger.error(
+                        "Retry failed for customer %s (%s). "
+                        "Continuing without billing enrichment.",
+                        parsed.get("customer_id"),
+                        exc2,
+                    )
 
         return parsed
 
