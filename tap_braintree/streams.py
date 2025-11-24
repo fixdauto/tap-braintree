@@ -16,9 +16,6 @@ from singer_sdk.typing import (
 import time
 from datetime import datetime, timedelta, date
 from pathlib import Path
-import pytz
-from dateutil.relativedelta import relativedelta
-from dateutil.parser import isoparse
 
 import braintree
 from tap_braintree.client import BraintreeStream
@@ -577,124 +574,6 @@ class SubscriptionsStream(BraintreeStream):
         Property("trial_period", BooleanType),
         Property("updated_at", DateTimeType),
     ).to_dict()
-
-    def get_records(self, context: Optional[dict]) -> Iterable[dict]:
-        """Return a generator of row-type dictionary objects."""
-        self.logger.info(f" tap_states: {self.tap_state}")
-        self.set_braintree_config()
-        end_timestamp = datetime.utcnow().replace(tzinfo=pytz.UTC)
-
-        # Logic for braintree subscriptions full sync.
-        if self.config["sync_state"] == "full":
-            yield from super().get_records(context)
-            return
-
-        start_timestamp = self.get_starting_timestamp(context) or isoparse(self.start_date)
-        start_timestamp = start_timestamp.replace(tzinfo=pytz.UTC)
-
-        yielded_ids = set()
-
-        for start, end in self.date_range(
-            start_timestamp,
-            end_timestamp,
-            interval_in_hours=self.fetch_records_interval_hours,
-        ):
-            # 1. Fetch by Created At (Standard)
-            while True:
-                try:
-                    records = self.braintree_obj.search(
-                        self.braintree_search.between(start, end)
-                    )
-                    self.check_api_result_limits(records)
-                    max_records_expected = records.maximum_size
-                    self.logger.info(
-                        " {}: Fetched {} records from {} - {}".format(
-                            self.name, max_records_expected, start, end
-                        )
-                    )
-
-                    processed_count = 0
-                    for record in records:
-                        if self.contains_latest_record(record, datetime.strptime(self.global_stream_state, "%Y-%m-%d")):
-                            if record.id not in yielded_ids:
-                                yielded_ids.add(record.id)
-                                processed_count += 1
-                                yield self.parse_record(record)
-
-                except braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError as e:
-                    self.logger.error(f" Exception: {str(e)}")
-                    self.logger.error("Waiting 1 hour, then trying again...")
-                    time.sleep(3600)
-                    continue
-
-                except (ConnectionError, Exception) as e: # Catch generic Exception for ReadTimeout which might not be imported
-                    self.logger.error(
-                        " {}: Failed to process records from {} - {}".format(
-                            self.name,
-                            start.date(),
-                            end.date(),
-                        )
-                    )
-                    self.logger.error(f" Exception: {str(e)}")
-                    break
-
-                self.logger.info(
-                    " {}: Processed {} of {} records at {}".format(
-                        self.name,
-                        processed_count,
-                        max_records_expected,
-                        datetime.utcnow(),
-                    )
-                )
-                break
-
-            # 2. Fetch by Transaction Activity (New Logic)
-            self.logger.info(f" {self.name}: Searching for subscriptions via transactions from {start} - {end}")
-            while True:
-                try:
-                    # Search transactions created in this window
-                    transaction_records = braintree.Transaction.search(
-                        braintree.TransactionSearch.created_at.between(start, end)
-                    )
-                    
-                    subscription_ids = set()
-                    for txn in transaction_records:
-                        if hasattr(txn, 'subscription_id') and txn.subscription_id:
-                            subscription_ids.add(txn.subscription_id)
-                    
-                    # Filter out already yielded
-                    subscription_ids = subscription_ids - yielded_ids
-                    
-                    if not subscription_ids:
-                        break
-
-                    self.logger.info(f" {self.name}: Found {len(subscription_ids)} potential updated subscriptions from transactions.")
-
-                    ids_list = list(subscription_ids)
-                    chunk_size = 50
-                    for i in range(0, len(ids_list), chunk_size):
-                        chunk = ids_list[i:i + chunk_size]
-                        
-                        subs = braintree.Subscription.search(
-                            braintree.SubscriptionSearch.ids.in_list(chunk)
-                        )
-                        
-                        for sub in subs:
-                             if self.contains_latest_record(sub, datetime.strptime(self.global_stream_state, "%Y-%m-%d")):
-                                if sub.id not in yielded_ids:
-                                    yielded_ids.add(sub.id)
-                                    yield self.parse_record(sub)
-
-                except braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError as e:
-                    self.logger.error(f" Exception: {str(e)}")
-                    self.logger.error("Waiting 1 hour, then trying again...")
-                    time.sleep(3600)
-                    continue
-                except Exception as e:
-                     self.logger.error(f"Error fetching subscriptions via transactions: {e}")
-                     break
-                
-                break
 
 
 class CustomersStream(BraintreeStream):
