@@ -581,7 +581,7 @@ class SubscriptionsStream(BraintreeStream):
     def get_records(self, context: Optional[dict]) -> Iterable[dict]:
         """Return a generator of row-type dictionary objects.
         
-        This method implements a multi-strategy approach to capture subscription updates:
+        Fetches subscription updates using a combination of search strategies:
         
         1. Created At Search: Captures newly created subscriptions
         2. Transaction Lookahead: Captures renewals/payments by finding subscriptions 
