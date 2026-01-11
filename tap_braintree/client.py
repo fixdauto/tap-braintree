@@ -345,7 +345,7 @@ class BraintreeStream(Stream):
                             yield self.parse_record(record)
 
                 # -------- Next billing date today ±2 days (windowed) --------
-                for day_offset in range(-2, 1):
+                for day_offset in range(-2, 2):
                     self.logger.info(f"Fetching subscriptions with next billing date from {now_date + timedelta(days=day_offset)}")
                     target_date = now_date + timedelta(days=day_offset)
                     records = self.braintree_obj.search(
@@ -367,7 +367,7 @@ class BraintreeStream(Stream):
                 # -------- Next billing date ~1 year out ±2 days (windowed) --------
                 one_year_out = now_date + timedelta(days=365)
 
-                for day_offset in range(-2, 1):
+                for day_offset in range(-2, 2):
                     target_date = one_year_out + timedelta(days=day_offset)
                     self.logger.info(f"Fetching subscriptions with next billing date from {target_date}")
                     records = self.braintree_obj.search(
