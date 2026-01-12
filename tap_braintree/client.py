@@ -2,6 +2,7 @@
 import braintree
 import pytz
 import time
+import itertools
 from flatten_json import flatten
 from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
@@ -43,7 +44,8 @@ class BraintreeStream(Stream):
         # fetches the previous month's data for each year in the time since the start_date.
         if self.config["sync_state"] == "regular":
             if self.name == "subscriptions":
-                return str(datetime.now() - relativedelta(months=1))
+                self.logger.info(f"start_date: {str(datetime.now() - relativedelta(days=35))}")
+                return str(datetime.now() - relativedelta(days=35))
             elif self.name == "transactions":
                 return str(datetime.now() - relativedelta(days=10))
             else:
@@ -228,6 +230,7 @@ class BraintreeStream(Stream):
         self.logger.info(f" tap_states: {self.tap_state}")
         self.set_braintree_config()
         end_timestamp = datetime.utcnow().replace(tzinfo=pytz.UTC)
+        # end_timestamp = end_timestamp = datetime(2023, 12, 11, datetime.utcnow().hour, datetime.utcnow().minute, datetime.utcnow().second).replace(tzinfo=pytz.UTC)
         
         # Logic for braintree subscriptions full sync.
         if self.config["sync_state"] == "full":
@@ -309,53 +312,134 @@ class BraintreeStream(Stream):
             start_timestamp = self.get_starting_timestamp(context) or isoparse(self.start_date)
             start_timestamp = start_timestamp.replace(tzinfo=pytz.UTC)
 
-            for start, end in self.date_range(
-                start_timestamp,
-                end_timestamp,
-                interval_in_hours=self.fetch_records_interval_hours,
-            ):
-                while True:
-                    try:
-                        records = self.braintree_obj.search(
-                            self.braintree_search.between(start, end)
-                        )
-                        self.check_api_result_limits(records)
-                        max_records_expected = records.maximum_size
-                        self.logger.info(
-                            " {}: Fetched {} records from {} - {}".format(
-                                self.name, max_records_expected, start, end
-                            )
-                        )
+            if self.name == "subscriptions":
+                self.logger.info("Running subscription sync with bounded time windows")
 
-                        processed_count = 0
-                        for record in records:
-                            if self.contains_latest_record(record, datetime.strptime(self.global_stream_state, "%Y-%m-%d")):
-                                processed_count += 1
-                                yield self.parse_record(record)
+                now_dt = datetime.utcnow().replace(tzinfo=pytz.UTC)
+                now_date = now_dt.date()
+                last_updated = datetime.strptime(self.global_stream_state, "%Y-%m-%d")
 
-                    except braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError as e:
-                        self.logger.error(f" Exception: {str(e)}")
-                        self.logger.error("Waiting 1 hour, then trying again...")
-                        time.sleep(3600)
-                        continue
+                seen_ids = set()
+                processed_count = 0
 
-                    except (ConnectionError, ReadTimeout) as e:
-                        self.logger.error(
-                            " {}: Failed to process records from {} - {}".format(
-                                self.name,
-                                start.date(),
-                                end.date(),
-                            )
-                        )
-                        self.logger.error(f" Exception: {str(e)}")
-                        break
+                # -------- Created in last 35 days (windowed) --------
+                created_start = now_dt - relativedelta(days=35)
 
-                    self.logger.info(
-                        " {}: Processed {} of {} records at {}".format(
-                            self.name,
-                            processed_count,
-                            max_records_expected,
-                            datetime.utcnow(),
+                for start, end in self.date_range(
+                    created_start,
+                    now_dt,
+                    interval_in_hours=self.fetch_records_interval_hours,
+                ):
+                    self.logger.info(f"Fetching subscriptions created from {start} to {end}")
+                    records = self.braintree_obj.search(
+                        braintree.SubscriptionSearch.created_at.between(start, end)
+                    )
+                    self.check_api_result_limits(records)
+
+                    for record in records:
+                        if record.id in seen_ids:
+                            continue
+                        if self.contains_latest_record(record, last_updated):
+                            seen_ids.add(record.id)
+                            processed_count += 1
+                            yield self.parse_record(record)
+
+                # -------- Next billing date today ±2 days (windowed) --------
+                for day_offset in range(-2, 2):
+                    self.logger.info(f"Fetching subscriptions with next billing date from {now_date + timedelta(days=day_offset)}")
+                    target_date = now_date + timedelta(days=day_offset)
+                    records = self.braintree_obj.search(
+                        braintree.SubscriptionSearch.next_billing_date.between(
+                            target_date,
+                            target_date,
                         )
                     )
-                    break
+                    self.check_api_result_limits(records)
+
+                    for record in records:
+                        if record.id in seen_ids:
+                            continue
+                        if self.contains_latest_record(record, last_updated):
+                            seen_ids.add(record.id)
+                            processed_count += 1
+                            yield self.parse_record(record)
+
+                # -------- Next billing date ~1 year out ±2 days (windowed) --------
+                one_year_out = now_date + timedelta(days=365)
+
+                for day_offset in range(-2, 2):
+                    target_date = one_year_out + timedelta(days=day_offset)
+                    self.logger.info(f"Fetching subscriptions with next billing date from {target_date}")
+                    records = self.braintree_obj.search(
+                        braintree.SubscriptionSearch.next_billing_date.between(
+                            target_date,
+                            target_date,
+                        )
+                    )
+                    self.check_api_result_limits(records)
+
+                    for record in records:
+                        if record.id in seen_ids:
+                            continue
+                        if self.contains_latest_record(record, last_updated):
+                            seen_ids.add(record.id)
+                            processed_count += 1
+                            yield self.parse_record(record)
+
+                self.logger.info(
+                    " subscriptions: Processed {} unique records at {}".format(
+                        processed_count,
+                        datetime.utcnow(),
+                    )
+                )
+
+            else:
+                end_timestamp = datetime.utcnow().replace(tzinfo=pytz.UTC)
+
+                for start, end in self.date_range(
+                    start_timestamp,
+                    end_timestamp,
+                    interval_in_hours=self.fetch_records_interval_hours,
+                ):
+                    while True:
+                        try:
+                            records = self.braintree_obj.search(
+                                self.braintree_search.between(start, end)
+                            )
+                            self.check_api_result_limits(records)
+
+                            processed_count = 0
+                            for record in records:
+                                if self.contains_latest_record(
+                                    record,
+                                    datetime.strptime(self.global_stream_state, "%Y-%m-%d"),
+                                ):
+                                    processed_count += 1
+                                    yield self.parse_record(record)
+
+                            self.logger.info(
+                                " {}: Processed {} of {} records at {}".format(
+                                    self.name,
+                                    processed_count,
+                                    records.maximum_size,
+                                    datetime.utcnow(),
+                                )
+                            )
+                            break
+
+                        except braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError as e:
+                            self.logger.error(f" Exception: {str(e)}")
+                            self.logger.error("Waiting 1 hour, then trying again...")
+                            time.sleep(3600)
+                            continue
+
+                        except (ConnectionError, ReadTimeout) as e:
+                            self.logger.error(
+                                " {}: Failed to process records from {} - {}".format(
+                                    self.name,
+                                    start.date(),
+                                    end.date(),
+                                )
+                            )
+                            self.logger.error(f" Exception: {str(e)}")
+                            break
