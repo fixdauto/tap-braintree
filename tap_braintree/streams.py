@@ -1,6 +1,6 @@
 """Stream type classes for tap-braintree."""
 
-from typing import Any, Dict, Optional, Union, List, Iterable
+from typing import Any, Dict, Optional, Union, List, Iterable, Set
 
 from singer_sdk.typing import PropertiesList, Property
 from singer_sdk.typing import (
@@ -16,6 +16,9 @@ from singer_sdk.typing import (
 import time
 from datetime import datetime, timedelta, date
 from pathlib import Path
+import pytz
+from dateutil.relativedelta import relativedelta
+from dateutil.parser import isoparse
 
 import braintree
 from tap_braintree.client import BraintreeStream
@@ -574,6 +577,251 @@ class SubscriptionsStream(BraintreeStream):
         Property("trial_period", BooleanType),
         Property("updated_at", DateTimeType),
     ).to_dict()
+
+    def get_records(self, context: Optional[dict]) -> Iterable[dict]:
+        """Return a generator of row-type dictionary objects.
+        
+        Fetches subscription updates using a combination of search strategies:
+        
+        1. Created At Search: Captures newly created subscriptions
+        2. Transaction Lookahead: Captures renewals/payments by finding subscriptions 
+           with recent transactions
+        3. Status-Based Discovery: Captures cancellations and status changes by searching
+           for subscriptions in Canceled/Expired states that were recently updated
+        4. Next Billing Date Search: Captures subscriptions with upcoming billing dates
+           to ensure we have their latest state
+        """
+        self.logger.info(f" tap_states: {self.tap_state}")
+        self.set_braintree_config()
+        end_timestamp = datetime.utcnow().replace(tzinfo=pytz.UTC)
+
+        # Logic for braintree subscriptions full sync.
+        if self.config["sync_state"] == "full":
+            yield from super().get_records(context)
+            return
+
+        start_timestamp = self.get_starting_timestamp(context) or isoparse(self.start_date)
+        start_timestamp = start_timestamp.replace(tzinfo=pytz.UTC)
+
+        yielded_ids = set()
+        last_updated_threshold = datetime.strptime(self.global_stream_state, "%Y-%m-%d")
+
+        for start, end in self.date_range(
+            start_timestamp,
+            end_timestamp,
+            interval_in_hours=self.fetch_records_interval_hours,
+        ):
+            # 1. Fetch by Created At (Standard) - Captures new subscriptions
+            while True:
+                try:
+                    records = self.braintree_obj.search(
+                        self.braintree_search.between(start, end)
+                    )
+                    self.check_api_result_limits(records)
+                    max_records_expected = records.maximum_size
+                    self.logger.info(
+                        " {}: Fetched {} records from {} - {}".format(
+                            self.name, max_records_expected, start, end
+                        )
+                    )
+
+                    processed_count = 0
+                    for record in records:
+                        if self.contains_latest_record(record, last_updated_threshold):
+                            if record.id not in yielded_ids:
+                                yielded_ids.add(record.id)
+                                processed_count += 1
+                                yield self.parse_record(record)
+
+                except braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError as e:
+                    self.logger.error(f" Exception: {str(e)}")
+                    self.logger.error("Waiting 1 hour, then trying again...")
+                    time.sleep(3600)
+                    continue
+
+                except (ConnectionError, Exception) as e:
+                    self.logger.error(
+                        " {}: Failed to process records from {} - {}".format(
+                            self.name,
+                            start.date(),
+                            end.date(),
+                        )
+                    )
+                    self.logger.error(f" Exception: {str(e)}")
+                    break
+
+                self.logger.info(
+                    " {}: Processed {} of {} records at {}".format(
+                        self.name,
+                        processed_count,
+                        max_records_expected,
+                        datetime.utcnow(),
+                    )
+                )
+                break
+
+            # 2. Fetch by Transaction Activity - Captures renewals/payments
+            self.logger.info(f" {self.name}: Searching for subscriptions via transactions from {start} - {end}")
+            while True:
+                try:
+                    transaction_records = braintree.Transaction.search(
+                        braintree.TransactionSearch.created_at.between(start, end)
+                    )
+                    
+                    subscription_ids = set()
+                    for txn in transaction_records:
+                        if hasattr(txn, 'subscription_id') and txn.subscription_id:
+                            subscription_ids.add(txn.subscription_id)
+                    
+                    subscription_ids = subscription_ids - yielded_ids
+                    
+                    if subscription_ids:
+                        self.logger.info(f" {self.name}: Found {len(subscription_ids)} potential updated subscriptions from transactions.")
+                        yield from self._fetch_subscriptions_by_ids(subscription_ids, yielded_ids, last_updated_threshold)
+
+                except braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError as e:
+                    self.logger.error(f" Exception: {str(e)}")
+                    self.logger.error("Waiting 1 hour, then trying again...")
+                    time.sleep(3600)
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Error fetching subscriptions via transactions: {e}")
+                    break
+                
+                break
+
+        # 3. Status-Based Discovery - Captures cancellations and status changes
+        # Search for subscriptions in terminal states (Canceled, Expired) that may have 
+        # changed status since our last sync. This catches cancellations that don't 
+        # generate transactions.
+        self.logger.info(f" {self.name}: Searching for canceled/expired subscriptions...")
+        yield from self._fetch_subscriptions_by_status(
+            [
+                braintree.Subscription.Status.Canceled,
+                braintree.Subscription.Status.Expired,
+            ],
+            yielded_ids,
+            last_updated_threshold,
+            "canceled/expired"
+        )
+        
+        # Also check PastDue subscriptions - these may transition to canceled
+        self.logger.info(f" {self.name}: Searching for past due subscriptions...")
+        yield from self._fetch_subscriptions_by_status(
+            [braintree.Subscription.Status.PastDue],
+            yielded_ids,
+            last_updated_threshold,
+            "past due"
+        )
+
+        # 4. Next Billing Date Search - Ensures we have fresh data for upcoming renewals
+        # This helps catch any subscriptions that might renew soon and ensures we have
+        # their latest state before the billing happens.
+        upcoming_billing_cutoff = end_timestamp + timedelta(days=7)
+        self.logger.info(f" {self.name}: Searching for subscriptions with upcoming billing dates (next 7 days)...")
+        while True:
+            try:
+                upcoming_subs = braintree.Subscription.search(
+                    braintree.SubscriptionSearch.next_billing_date.between(
+                        end_timestamp, 
+                        upcoming_billing_cutoff
+                    ),
+                    braintree.SubscriptionSearch.status == braintree.Subscription.Status.Active
+                )
+                
+                processed_count = 0
+                for sub in upcoming_subs:
+                    if sub.id not in yielded_ids:
+                        if self.contains_latest_record(sub, last_updated_threshold):
+                            yielded_ids.add(sub.id)
+                            processed_count += 1
+                            yield self.parse_record(sub)
+                
+                self.logger.info(f" {self.name}: Found {processed_count} subscriptions with upcoming billing dates.")
+                
+            except braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError as e:
+                self.logger.error(f" Exception: {str(e)}")
+                self.logger.error("Waiting 1 hour, then trying again...")
+                time.sleep(3600)
+                continue
+            except Exception as e:
+                self.logger.error(f"Error fetching subscriptions by next_billing_date: {e}")
+                break
+            
+            break
+
+        self.logger.info(f" {self.name}: Sync complete. Total unique subscriptions yielded: {len(yielded_ids)}")
+
+    def _fetch_subscriptions_by_ids(
+        self, 
+        subscription_ids: set, 
+        yielded_ids: set, 
+        last_updated_threshold: datetime
+    ) -> Iterable[dict]:
+        """Fetch subscriptions by IDs in chunks and yield parsed records."""
+        ids_list = list(subscription_ids)
+        chunk_size = 50
+        
+        for i in range(0, len(ids_list), chunk_size):
+            chunk = ids_list[i:i + chunk_size]
+            
+            try:
+                subs = braintree.Subscription.search(
+                    braintree.SubscriptionSearch.ids.in_list(chunk)
+                )
+                
+                for sub in subs:
+                    if self.contains_latest_record(sub, last_updated_threshold):
+                        if sub.id not in yielded_ids:
+                            yielded_ids.add(sub.id)
+                            yield self.parse_record(sub)
+                            
+            except Exception as e:
+                self.logger.error(f"Error fetching subscription chunk: {e}")
+                continue
+
+    def _fetch_subscriptions_by_status(
+        self,
+        statuses: List,
+        yielded_ids: set,
+        last_updated_threshold: datetime,
+        status_description: str
+    ) -> Iterable[dict]:
+        """Fetch subscriptions by status and yield those updated since threshold.
+        
+        This is the key method for catching cancellations - subscriptions that 
+        transition to Canceled/Expired don't generate transactions, but their
+        status_history will show they were recently updated.
+        """
+        while True:
+            try:
+                subs = braintree.Subscription.search(
+                    braintree.SubscriptionSearch.status.in_list(statuses)
+                )
+                
+                processed_count = 0
+                for sub in subs:
+                    if sub.id not in yielded_ids:
+                        # Check if this subscription was recently updated
+                        if self.contains_latest_record(sub, last_updated_threshold):
+                            yielded_ids.add(sub.id)
+                            processed_count += 1
+                            yield self.parse_record(sub)
+                
+                self.logger.info(
+                    f" {self.name}: Found {processed_count} recently updated {status_description} subscriptions."
+                )
+                
+            except braintree.exceptions.down_for_maintenance_error.DownForMaintenanceError as e:
+                self.logger.error(f" Exception: {str(e)}")
+                self.logger.error("Waiting 1 hour, then trying again...")
+                time.sleep(3600)
+                continue
+            except Exception as e:
+                self.logger.error(f"Error fetching {status_description} subscriptions: {e}")
+                break
+            
+            break
 
 
 class CustomersStream(BraintreeStream):
