@@ -16,7 +16,9 @@ from braintree.transaction_details import TransactionDetails
 
 from typing import Any, Dict, Optional, Union, List, Iterable
 
-from requests.exceptions import ReadTimeout
+from requests.exceptions import ReadTimeout, ChunkedEncodingError
+
+NETWORK_RETRY_WAIT_SECONDS = 60
 from singer_sdk.streams import Stream
 
 
@@ -287,16 +289,18 @@ class BraintreeStream(Stream):
                             time.sleep(3600)
                             continue
 
-                        except (ConnectionError, ReadTimeout) as e:
+                        except (ConnectionError, ReadTimeout, ChunkedEncodingError) as e:
                             self.logger.error(
-                                " {}: Failed to process records from {} - {}".format(
+                                " {}: Network error for records from {} - {}, retrying in {}s...".format(
                                     self.name,
                                     start.date(),
                                     end.date(),
+                                    NETWORK_RETRY_WAIT_SECONDS,
                                 )
                             )
                             self.logger.error(f" Exception: {str(e)}")
-                            break
+                            time.sleep(NETWORK_RETRY_WAIT_SECONDS)
+                            continue
 
                         self.logger.info(
                             " {}: Processed {} of {} records at {}".format(
@@ -433,13 +437,15 @@ class BraintreeStream(Stream):
                             time.sleep(3600)
                             continue
 
-                        except (ConnectionError, ReadTimeout) as e:
+                        except (ConnectionError, ReadTimeout, ChunkedEncodingError) as e:
                             self.logger.error(
-                                " {}: Failed to process records from {} - {}".format(
+                                " {}: Network error for records from {} - {}, retrying in {}s...".format(
                                     self.name,
                                     start.date(),
                                     end.date(),
+                                    NETWORK_RETRY_WAIT_SECONDS,
                                 )
                             )
                             self.logger.error(f" Exception: {str(e)}")
-                            break
+                            time.sleep(NETWORK_RETRY_WAIT_SECONDS)
+                            continue
