@@ -172,7 +172,13 @@ class BraintreeStream(Stream):
                     getattr(d, attr), ignore_obj, level=level
                 )
             elif hasattr(d, attr):
-                flat_attr[attr] = getattr(d, attr)
+                value = getattr(d, attr)
+                if isinstance(value, datetime):
+                    flat_attr[attr] = str(value.replace(tzinfo=pytz.UTC) if value.tzinfo is None else value)
+                elif isinstance(value, date):
+                    flat_attr[attr] = str(datetime(value.year, value.month, value.day, tzinfo=pytz.UTC))
+                else:
+                    flat_attr[attr] = value
             else:
                 return
 
