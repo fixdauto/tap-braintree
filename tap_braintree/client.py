@@ -131,14 +131,19 @@ class BraintreeStream(Stream):
                 addresses = getattr(d, attr)
                 if addresses and len(addresses) > 0:
                     valid_address = next(
-                        (addr for addr in addresses if hasattr(addr, "country_code_alpha2") 
+                        (addr for addr in addresses if hasattr(addr, "country_code_alpha2")
                          and getattr(addr, "country_code_alpha2") is not None),
-                        addresses[0]  # Fallback to first address if none found
+                        addresses[0]
                     )
                     # Prefix address fields to avoid conflicts
                     for address_attr in valid_address._setattrs:
                         if hasattr(valid_address, address_attr):
-                            flat_attr[f"address_{address_attr}"] = getattr(valid_address, address_attr)
+                            value = getattr(valid_address, address_attr)
+                            if isinstance(value, datetime):
+                                value = str(value.replace(tzinfo=pytz.UTC) if value.tzinfo is None else value)
+                            elif isinstance(value, date):
+                                value = str(datetime(value.year, value.month, value.day, tzinfo=pytz.UTC))
+                            flat_attr[f"address_{address_attr}"] = value
                 continue
             if hasattr(d, attr) and isinstance(
                 getattr(d, attr), (list, set, tuple, types.GeneratorType)
