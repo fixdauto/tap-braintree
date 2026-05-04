@@ -131,19 +131,14 @@ class BraintreeStream(Stream):
                 addresses = getattr(d, attr)
                 if addresses and len(addresses) > 0:
                     valid_address = next(
-                        (addr for addr in addresses if hasattr(addr, "country_code_alpha2")
+                        (addr for addr in addresses if hasattr(addr, "country_code_alpha2") 
                          and getattr(addr, "country_code_alpha2") is not None),
-                        addresses[0]
+                        addresses[0]  # Fallback to first address if none found
                     )
                     # Prefix address fields to avoid conflicts
                     for address_attr in valid_address._setattrs:
                         if hasattr(valid_address, address_attr):
-                            value = getattr(valid_address, address_attr)
-                            if isinstance(value, datetime):
-                                value = str(value.replace(tzinfo=pytz.UTC) if value.tzinfo is None else value)
-                            elif isinstance(value, date):
-                                value = str(datetime(value.year, value.month, value.day, tzinfo=pytz.UTC))
-                            flat_attr[f"address_{address_attr}"] = value
+                            flat_attr[f"address_{address_attr}"] = getattr(valid_address, address_attr)
                 continue
             if hasattr(d, attr) and isinstance(
                 getattr(d, attr), (list, set, tuple, types.GeneratorType)
@@ -224,6 +219,18 @@ class BraintreeStream(Stream):
                 return True
         return False
 
+    def _sanitize_datetimes(self, obj):
+        """Recursively convert any raw datetime/date objects to strings."""
+        if isinstance(obj, datetime):
+            return str(obj.replace(tzinfo=pytz.UTC) if obj.tzinfo is None else obj)
+        elif isinstance(obj, date):
+            return str(datetime(obj.year, obj.month, obj.day, tzinfo=pytz.UTC))
+        elif isinstance(obj, dict):
+            return {k: self._sanitize_datetimes(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._sanitize_datetimes(i) for i in obj]
+        return obj
+
     def parse_record(self, record) -> dict:
         json_obj = {
             "disputes",
@@ -236,7 +243,7 @@ class BraintreeStream(Stream):
         ignore_obj = {"transactions"}
 
         data = self.object_to_dict(record, ignore_obj)
-        return data
+        return self._sanitize_datetimes(data)
 
     def get_records(self, context: Optional[dict]) -> Iterable[dict]:
         """Return a generator of row-type dictionary objects."""
